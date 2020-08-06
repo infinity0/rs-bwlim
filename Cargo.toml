@@ -1,0 +1,25 @@
+[package]
+name = "bwlim"
+version = "0.1.0"
+authors = ["Ximin Luo"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = "2"
+futures = "0.3"
+
+# bwlim-test-tokio
+tokio = { version = "0.2", features = ["full"] }
+tokio-util = { version = "0.3", features = ["compat"] }
+
+# bwlim-test-async
+async-io = "0.1"
+smol = "0.3"
+
+[[bin]]
+name = "bwlim-test-async"
+
+[[bin]]
+name = "bwlim-test-tokio"

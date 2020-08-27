@@ -1,4 +1,6 @@
 use bwlim::testing::*;
+use bwlim::RLAsync;
+use bwlim::util::RW;
 
 use std::net::{SocketAddr, TcpStream, TcpListener};
 use std::process::{Command, Stdio};
@@ -12,7 +14,7 @@ use async_io::Async;
 use smol::Task;
 
 async fn async_main() {
-  let (test_bytes, listen, connect, host) = get_args();
+  let (test_bytes, listen, connect, host, rate_limit) = get_args();
 
   let listen_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), listen);
   let connect_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), connect);
@@ -39,7 +41,12 @@ async fn async_main() {
       futures::select! {
         val = listener.accept().fuse() => {
           let (socket, _) = val.unwrap();
-          workers.push(Task::spawn(server_thread(socket)));
+          let thread = if rate_limit {
+            Task::spawn(server_thread(RLAsync::new(RW(socket.into_inner().unwrap())).unwrap()))
+          } else {
+            Task::spawn(server_thread(socket))
+          };
+          workers.push(thread);
         },
         _ = is_shutdown.next() => {
           break;
@@ -53,12 +60,20 @@ async fn async_main() {
     println!("server: shutting down");
   });
 
+  thread::sleep(Duration::from_millis(1000)); // TODO: get rid of this
+
   // client threads
   let clients = [0; 2].iter().map(|_| {
     Task::spawn(async move {
       let mut stream = Async::<TcpStream>::connect(connect_addr).await.unwrap();
-      client_thread(&mut stream, test_bytes).await;
-      stream.close().await.unwrap();
+      if rate_limit {
+        let mut stream = RLAsync::new(RW(stream.into_inner().unwrap())).unwrap();
+        client_thread(&mut stream, test_bytes).await;
+        stream.close().await.unwrap();
+      } else {
+        client_thread(&mut stream, test_bytes).await;
+        stream.close().await.unwrap();
+      }
     })
   }).collect::<Vec<_>>();
   future::join_all(clients).await;

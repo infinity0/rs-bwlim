@@ -13,7 +13,7 @@ use tokio_util::compat::*;
 
 #[tokio::main]
 async fn main() {
-  let (test_bytes, listen, connect, host) = get_args();
+  let (test_bytes, listen, connect, host, _) = get_args();
 
   let listen_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), listen);
   let connect_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), connect);

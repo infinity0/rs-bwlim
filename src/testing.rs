@@ -1,6 +1,6 @@
 // TODO: measure latency between client and corresponding server-worker
 
-use crate::BWStats;
+use crate::stats::BWStats;
 
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use clap::{App, Arg};
@@ -37,6 +37,7 @@ pub async fn client_thread<W: Unpin + AsyncWriteExt>(stream: &mut W, len: usize)
   while remain > 0 {
     let bytes_to_write = if remain >= TEST_CHUNK.len() { TEST_CHUNK.len() } else { remain };
     stream.write_all(&TEST_CHUNK[0..bytes_to_write]).await.unwrap();
+    stream.flush().await.unwrap();
     //println!("client: wrote to stream; success={:?}", result.is_ok());
     remain -= bytes_to_write;
     stats.add(bytes_to_write);
@@ -47,7 +48,7 @@ pub async fn client_thread<W: Unpin + AsyncWriteExt>(stream: &mut W, len: usize)
   println!("client: {} B sent in {} us: ~{} MBps", s, t, if *t == 0 { 0 } else { s / t });
 }
 
-pub fn get_args() -> (usize, u16, u16, Option<String>) {
+pub fn get_args() -> (usize, u16, u16, Option<String>, bool) {
   let m = App::new("Bandwidth limit tester")
         .version("0.0")
         .author("Ximin Luo <ximin@web3.foundation>")
@@ -56,14 +57,14 @@ pub fn get_args() -> (usize, u16, u16, Option<String>) {
              .short("p")
              .long("port")
              .value_name("PORT")
-             .help("Local port for listening")
-             .default_value("6397"))
+             .default_value("6397")
+             .help("Local port for listening"))
         .arg(Arg::with_name("bytes")
              .short("b")
              .long("bytes")
              .value_name("NUM")
-             .help("Number of bytes to send per client")
-             .default_value("16777216"))
+             .default_value("16777216")
+             .help("Number of bytes to send per client"))
         .arg(Arg::with_name("connect")
              .short("c")
              .long("connect")
@@ -75,6 +76,12 @@ pub fn get_args() -> (usize, u16, u16, Option<String>) {
              .value_name("HOST")
              .help("Remote ssh host for setting up an ssh loopback proxy. \
                    Use ssh_config if you need to configure more things."))
+        .arg(Arg::with_name("rate_limit")
+             .short("r")
+             .long("rate-limit")
+             .value_name("BOOL")
+             .default_value("true")
+             .help("Whether to perform rate-limiting"))
         .get_matches();
 
   let test_bytes = m.value_of("bytes").unwrap().parse::<usize>().unwrap();
@@ -87,7 +94,7 @@ pub fn get_args() -> (usize, u16, u16, Option<String>) {
     },
     _ => panic!("--host and --connect must be both set or unset"),
   };
-  (test_bytes, listen, connect, host.map(str::to_string))
+  (test_bytes, listen, connect, host.map(str::to_string), m.value_of("rate_limit").unwrap().parse::<bool>().unwrap())
 }
 
 pub fn get_ssh_args(host: String, connect: u16, listen: u16) -> Vec<String> {
@@ -99,4 +106,5 @@ pub fn get_ssh_args(host: String, connect: u16, listen: u16) -> Vec<String> {
     format!("-Rlocalhost:{}:localhost:{}", remote, listen),
     "cat".to_string() // so it responds properly to EOF on stdin; -N ignores it*/
   ]
+  // FIXME: for some reason ssh fails to connect with --bytes < ~2.8MB, for both tokio/asyncio
 }

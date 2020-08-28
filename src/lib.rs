@@ -1,3 +1,5 @@
+#![feature(generic_associated_types)]
+
 pub mod limit;
 pub mod reactor;
 pub mod stats;
@@ -5,17 +7,19 @@ pub mod testing;
 pub mod util;
 pub mod sys;
 
+use std::borrow::*;
 use std::fmt::Debug;
-use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::pin::Pin;
 use std::mem::ManuallyDrop;
 use std::net::{Shutdown, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 use std::task::{Context, Poll};
 
+use async_io::*;
+use async_trait::async_trait;
+
 use futures_lite::io::{AsyncRead, AsyncWrite};
-use futures_lite::{future, pin};
 
 use crate::limit::RateLimited;
 use crate::util::RorW;
@@ -43,56 +47,53 @@ impl<T> Drop for RLAsync<T> {
     }
 }
 
-// copied from async-io, except:
-// self.get_mut() replaced with lock() / RateLimited
-// TODO: figure out a way to de-duplicate with them
-impl<T: Debug> RLAsync<T> {
-    pub async fn readable(&self) -> io::Result<()> {
+/// Wrapper for `MutexGuard` that implements `Borrow`/`BorrowMut`.
+pub struct MGW<'a, T: ?Sized>(pub MutexGuard<'a, T>);
+
+impl<T: ?Sized> Borrow<T> for MGW<'_, T> {
+    fn borrow(&self) -> &T {
+        &*self.0
+    }
+}
+
+impl<T: ?Sized> BorrowMut<T> for MGW<'_, T> {
+    fn borrow_mut(&mut self) -> &mut T {
+        &mut *self.0
+    }
+}
+
+#[async_trait]
+impl<T> AnAsync<RateLimited<T>> for RLAsync<T> where T: Send + Sync {
+    type Borrow<'a> where T: 'a = MGW<'a, RateLimited<T>>;
+    type BorrowMut<'a> where T: 'a = MGW<'a, RateLimited<T>>;
+
+    fn get_ref<'a>(&'a self) -> MGW<RateLimited<T>> {
+        MGW(self.source.raw.lock().unwrap())
+    }
+
+    fn get_mut<'a>(&'a mut self) -> MGW<RateLimited<T>> {
+        MGW(self.source.raw.lock().unwrap())
+    }
+
+    async fn readable(&self) -> io::Result<()> {
         self.source.readable().await
     }
-    pub async fn writable(&self) -> io::Result<()> {
+
+    async fn writable(&self) -> io::Result<()> {
         self.source.writable().await
     }
-    pub async fn read_with_mut<R>(
-        &mut self,
-        op: impl FnMut(&mut RateLimited<T>) -> io::Result<R>,
-    ) -> io::Result<R> {
-        let mut op = op;
-        loop {
-            // If there are no blocked readers, attempt the read operation.
-            if !self.source.readers_registered() {
-                let mut inner = self.source.raw.lock().unwrap();
-                match op(&mut inner) {
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                    res => return res,
-                }
-            }
-            // Wait until the I/O handle becomes readable.
-            optimistic(self.readable()).await?;
-        }
+
+    fn readers_registered(&self) -> bool {
+        self.source.readers_registered()
     }
-    pub async fn write_with_mut<R>(
-        &mut self,
-        op: impl FnMut(&mut RateLimited<T>) -> io::Result<R>,
-    ) -> io::Result<R> {
-        let mut op = op;
-        loop {
-            // If there are no blocked readers, attempt the write operation.
-            if !self.source.writers_registered() {
-                let mut inner = self.source.raw.lock().unwrap();
-                match op(&mut inner) {
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                    res => return res,
-                }
-            }
-            // Wait until the I/O handle becomes writable.
-            optimistic(self.writable()).await?;
-        }
+
+    fn writers_registered(&self) -> bool {
+        self.source.writers_registered()
     }
 }
 
 // copied from async-io
-impl<T: Read + Debug> AsyncRead for RLAsync<T> {
+impl<T: Read + Send + Sync> AsyncRead for RLAsync<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -111,7 +112,7 @@ impl<T: Read + Debug> AsyncRead for RLAsync<T> {
 }
 
 // copied from async-io
-impl<T: Write + Debug> AsyncWrite for RLAsync<T>
+impl<T: Write + Send + Sync> AsyncWrite for RLAsync<T>
 where
     T: AsRawSource
 {
@@ -139,28 +140,6 @@ where
         let inner = self.source.raw.lock().unwrap();
         Poll::Ready(shutdown_write(inner.inner.as_raw_source()))
     }
-}
-
-// copied from async-io
-fn poll_future<T>(cx: &mut Context<'_>, fut: impl Future<Output = T>) -> Poll<T> {
-    pin!(fut);
-    fut.poll(cx)
-}
-
-// copied from async-io
-async fn optimistic(fut: impl Future<Output = io::Result<()>>) -> io::Result<()> {
-    let mut polled = false;
-    pin!(fut);
-
-    future::poll_fn(|cx| {
-        if !polled {
-            polled = true;
-            fut.as_mut().poll(cx)
-        } else {
-            Poll::Ready(Ok(()))
-        }
-    })
-    .await
 }
 
 // copied from async-io

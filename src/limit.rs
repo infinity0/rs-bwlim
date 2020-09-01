@@ -318,6 +318,44 @@ impl<T> Write for RateLimited<T> where T: Write {
   }
 }
 
+#[derive(Debug)]
+pub struct UsageStats {
+  samples: VecDeque<(usize, usize)>,
+  max_samples: usize,
+  current_usage: (usize, usize), // (waste, used)
+}
+
+impl UsageStats {
+  pub fn new() -> UsageStats {
+    UsageStats {
+      samples: VecDeque::new(),
+      max_samples: 4096,
+      current_usage: (0, 0),
+    }
+  }
+
+  pub fn add_current_usage(&mut self, usage: (usize, usize)) {
+    self.current_usage.0 += usage.0;
+    self.current_usage.1 += usage.1;
+  }
+
+  pub fn finalise_current_usage(&mut self) -> (usize, usize) {
+    while self.samples.len() >= self.max_samples {
+      self.samples.pop_front();
+    }
+    let usage = self.current_usage;
+    self.samples.push_back(usage);
+    self.current_usage = (0, 0);
+    usage
+  }
+
+  pub fn estimate_next_usage(&mut self) -> usize {
+    // TODO: something smarter
+    // TODO: do something with the waste, e.g. to give more allowance
+    self.samples.back().unwrap().1
+  }
+}
+
 pub fn derive_allowance<K>(demand: HashMap<K, usize>) -> HashMap<K, usize> {
   // TODO: actually perform rate-limiting. the current code ought not
   // to be (but is) much slower than the async-io version, however

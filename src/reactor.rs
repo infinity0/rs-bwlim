@@ -24,7 +24,7 @@ use futures_lite::*;
 use async_io::Timer;
 use smol::Task;
 
-use crate::limit::{RateLimited, derive_allowance};
+use crate::limit::{RateLimited, UsageStats, derive_allowance};
 use crate::util::RorW;
 
 
@@ -96,6 +96,8 @@ impl Reactor {
   }
 
   pub(crate) async fn main_loop_async(&self) {
+    let mut usage_r = UsageStats::new();
+    let mut usage_w = UsageStats::new();
     loop {
       let mut wakers = Vec::new();
 
@@ -105,7 +107,7 @@ impl Reactor {
       if target > now {
         Timer::after(target - now).await;
       } else {
-        println!("rwlim reactor running slow: {:?} {:?} {:?}", tick_length, now, target);
+        log::warn!("rwlim reactor running slow: {:?} {:?} {:?}", tick_length, now, target);
       }
       let mut last_tick = self.last_tick.lock().unwrap();
       if Instant::now() >= target {
@@ -114,29 +116,25 @@ impl Reactor {
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
         let mut sources = self.sources.lock().unwrap();
-        let mut total_r = 0;
-        let mut total_w = 0;
 
-        // calculate demand from buffers
+        // calculate demand from buffers & estimate usage
         let mut demand = HashMap::new();
         for (key, source) in sources.iter_mut() {
           let rl = &mut *source.raw.lock().unwrap();
           if rl.inner.can_read() {
             rl.pre_read();
-            let (_wasted, used) = rl.rbuf.reset_usage();
-            total_r += used;
-            // TODO: do something with the waste, e.g. to give more allowance
+            usage_r.add_current_usage(rl.rbuf.reset_usage());
             demand.insert((key, SourceDirection::Read), rl.rbuf.get_demand());
           }
           if rl.inner.can_write() {
-            let (_wasted, used) = rl.wbuf.reset_usage();
-            total_w += used;
-            // TODO: do something with the waste, e.g. to give more allowance
+            usage_w.add_current_usage(rl.wbuf.reset_usage());
             demand.insert((key, SourceDirection::Write), rl.wbuf.get_demand());
           }
         }
-        if total_r > 0 || total_w > 0 {
-          log::trace!("main_loop_async: tick {}: RX {}, TX {}", tick, total_r, total_w);
+        let total_r = usage_r.finalise_current_usage();
+        let total_w = usage_w.finalise_current_usage();
+        if total_r.1 > 0 || total_w.1 > 0 {
+          log::trace!("main_loop_async: tick {}: RX {:?}, TX {:?}", tick, total_r, total_w);
         }
 
         // calculate allowance & make it effective

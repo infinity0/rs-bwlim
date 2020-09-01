@@ -1,5 +1,6 @@
 //! Data structures to help perform rate limiting.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::result::Result;
 use std::cmp;
@@ -315,6 +316,13 @@ impl<T> Write for RateLimited<T> where T: Write {
       }
     }
   }
+}
+
+pub fn derive_allowance<K>(demand: HashMap<K, usize>) -> HashMap<K, usize> {
+  // TODO: actually perform rate-limiting. the current code ought not
+  // to be (but is) much slower than the async-io version, however
+  // this only noticeable on localhost-localhost transfers.
+  demand
 }
 
 #[cfg(test)]

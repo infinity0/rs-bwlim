@@ -46,7 +46,7 @@ impl<T> Drop for RLAsync<T> {
 // copied from async-io, except:
 // self.get_mut() replaced with lock() / RateLimited
 // TODO: figure out a way to de-duplicate with them
-impl<T> RLAsync<T> {
+impl<T: Debug> RLAsync<T> {
     pub async fn readable(&self) -> io::Result<()> {
         self.source.readable().await
     }
@@ -92,7 +92,7 @@ impl<T> RLAsync<T> {
 }
 
 // copied from async-io
-impl<T: Read> AsyncRead for RLAsync<T> {
+impl<T: Read + Debug> AsyncRead for RLAsync<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -111,7 +111,7 @@ impl<T: Read> AsyncRead for RLAsync<T> {
 }
 
 // copied from async-io
-impl<T: Write> AsyncWrite for RLAsync<T>
+impl<T: Write + Debug> AsyncWrite for RLAsync<T>
 where
     T: AsRawSource
 {

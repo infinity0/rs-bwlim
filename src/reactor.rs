@@ -11,6 +11,7 @@ great benefit however, so keeping the current solution works OK for now.
 
 */
 
+use std::collections::HashMap;
 use std::panic;
 use std::sync::{atomic::*, Arc, Mutex};
 use std::task::{Poll, Waker};
@@ -23,9 +24,15 @@ use futures_lite::*;
 use async_io::Timer;
 use smol::Task;
 
-use crate::limit::RateLimited;
+use crate::limit::{RateLimited, derive_allowance};
 use crate::util::RorW;
 
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum SourceDirection {
+  Read,
+  Write,
+}
 
 #[derive(Debug)]
 pub(crate) struct Reactor {
@@ -106,30 +113,51 @@ impl Reactor {
             .ticker
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
+        let mut sources = self.sources.lock().unwrap();
+        let mut total_r = 0;
+        let mut total_w = 0;
 
-        for (key, source) in self.sources.lock().unwrap().iter_mut() {
+        // calculate demand from buffers
+        let mut demand = HashMap::new();
+        for (key, source) in sources.iter_mut() {
           let rl = &mut *source.inner.lock().unwrap();
           if rl.inner.can_read() {
             rl.pre_read();
-            rl.rbuf.reset_usage();
-            // TODO: actually perform rate-limiting. the current code ought not
-            // to be (but is) much slower than the async-io version.
-            rl.rbuf.add_allowance(rl.rbuf.get_demand());
+            let (_wasted, used) = rl.rbuf.reset_usage();
+            total_r += used;
+            // TODO: do something with the waste, e.g. to give more allowance
+            demand.insert((key, SourceDirection::Read), rl.rbuf.get_demand());
+          }
+          if rl.inner.can_write() {
+            let (_wasted, used) = rl.wbuf.reset_usage();
+            total_w += used;
+            // TODO: do something with the waste, e.g. to give more allowance
+            demand.insert((key, SourceDirection::Write), rl.wbuf.get_demand());
+          }
+        }
+        if total_r > 0 || total_w > 0 {
+          log::trace!("main_loop_async: tick {}: RX {}, TX {}", tick, total_r, total_w);
+        }
+
+        // calculate allowance & make it effective
+        let allowance = derive_allowance(demand);
+        for (key, source) in sources.iter_mut() {
+          let rl = &mut *source.inner.lock().unwrap();
+          if rl.inner.can_read() {
+            rl.rbuf.add_allowance(*allowance.get(&(key, SourceDirection::Read)).unwrap());
             if rl.is_readable() {
               self.react_evt(&mut wakers, &**source, true, false, tick);
             }
           }
           if rl.inner.can_write() {
-            rl.wbuf.reset_usage();
-            // TODO: actually perform rate-limiting. the current code ought not
-            // to be (but is) much slower than the async-io version.
-            rl.wbuf.add_allowance(rl.wbuf.get_demand());
+            rl.wbuf.add_allowance(*allowance.get(&(key, SourceDirection::Write)).unwrap());
             rl.post_write();
             if rl.is_writable() {
               self.react_evt(&mut wakers, &**source, false, true, tick);
             }
           }
         }
+
         *last_tick = Instant::now();
       }
       drop(last_tick);

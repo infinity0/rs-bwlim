@@ -31,6 +31,8 @@ async fn async_main() {
     ssh
   });
 
+  env_logger::init();
+
   // server thread
   let listener = Async::<TcpListener>::bind(listen_addr).unwrap();
   let (mut shutdown, mut is_shutdown) = mpsc::channel(1);

@@ -61,7 +61,7 @@ impl<T: Debug> RLAsync<T> {
         loop {
             // If there are no blocked readers, attempt the read operation.
             if !self.source.readers_registered() {
-                let mut inner = self.source.inner.lock().unwrap();
+                let mut inner = self.source.raw.lock().unwrap();
                 match op(&mut inner) {
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     res => return res,
@@ -79,7 +79,7 @@ impl<T: Debug> RLAsync<T> {
         loop {
             // If there are no blocked readers, attempt the write operation.
             if !self.source.writers_registered() {
-                let mut inner = self.source.inner.lock().unwrap();
+                let mut inner = self.source.raw.lock().unwrap();
                 match op(&mut inner) {
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     res => return res,
@@ -136,7 +136,7 @@ where
     }
 
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let inner = self.source.inner.lock().unwrap();
+        let inner = self.source.raw.lock().unwrap();
         Poll::Ready(shutdown_write(inner.inner.as_raw_source()))
     }
 }

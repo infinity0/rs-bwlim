@@ -74,7 +74,7 @@ impl Reactor {
       let mut sources = self.sources.lock().unwrap();
       let key = sources.next_vacant();
       let source = Arc::new(Source {
-          inner: Mutex::new(RateLimited::new_lb(inner, 65536)),
+          raw: Mutex::new(RateLimited::new_lb(inner, 65536)),
           key,
           wakers: Mutex::new(Wakers {
               tick_readable: 0,
@@ -120,7 +120,7 @@ impl Reactor {
         // calculate demand from buffers
         let mut demand = HashMap::new();
         for (key, source) in sources.iter_mut() {
-          let rl = &mut *source.inner.lock().unwrap();
+          let rl = &mut *source.raw.lock().unwrap();
           if rl.inner.can_read() {
             rl.pre_read();
             let (_wasted, used) = rl.rbuf.reset_usage();
@@ -142,7 +142,7 @@ impl Reactor {
         // calculate allowance & make it effective
         let allowance = derive_allowance(demand);
         for (key, source) in sources.iter_mut() {
-          let rl = &mut *source.inner.lock().unwrap();
+          let rl = &mut *source.raw.lock().unwrap();
           if rl.inner.can_read() {
             rl.rbuf.add_allowance(*allowance.get(&(key, SourceDirection::Read)).unwrap());
             if rl.is_readable() {
@@ -206,7 +206,7 @@ pub struct Source<T> where T: ?Sized {
   /// Whether there are wakers interrested in events on this source.
   wakers_registered: AtomicU8,
 
-  pub(crate) inner: Mutex<RateLimited<T>>,
+  pub(crate) raw: Mutex<RateLimited<T>>,
 }
 
 // copied from async-io. TODO: figure out a way to deduplicate

@@ -28,11 +28,9 @@ use crate::limit::{RateLimited, UsageStats, derive_allowance};
 use crate::util::RorW;
 
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-enum SourceDirection {
-  Read,
-  Write,
-}
+// TODO: make configurable at runtime by the application
+const TICK_LENGTH_MS: u64 = 1;
+const INIT_BUFSIZE: usize = 262143;
 
 #[derive(Debug)]
 pub(crate) struct Reactor {
@@ -74,7 +72,7 @@ impl Reactor {
       let mut sources = self.sources.lock().unwrap();
       let key = sources.next_vacant();
       let source = Arc::new(Source {
-          raw: Mutex::new(RateLimited::new_lb(inner, 65536)),
+          raw: Mutex::new(RateLimited::new_lb(inner, INIT_BUFSIZE)),
           key,
           wakers: Mutex::new(Wakers {
               tick_readable: 0,
@@ -96,59 +94,68 @@ impl Reactor {
   }
 
   pub(crate) async fn main_loop_async(&self) {
+    let tick_length = Duration::from_millis(TICK_LENGTH_MS);
     let mut usage_r = UsageStats::new();
     let mut usage_w = UsageStats::new();
     loop {
-      let mut wakers = Vec::new();
+      let (_tick_start, target) = {
+        let last_tick = &mut *self.last_tick.lock().unwrap();
+        // FIXME: this granularity may be too fine to pick up bandwidth usage across multiple streams
+        let now = Instant::now();
+        let target = now + tick_length;
+        *last_tick = now;
+        (now, target)
+      };
+      let tick = self
+          .ticker
+          .fetch_add(1, Ordering::SeqCst)
+          .wrapping_add(1);
 
-      let tick_length = Duration::from_millis(1); // rate-limit every 1 ms
-      let target = *self.last_tick.lock().unwrap() + tick_length;
-      let now = Instant::now();
-      if target > now {
-        Timer::after(target - now).await;
-      } else {
-        log::warn!("rwlim reactor running slow: {:?} {:?} {:?}", tick_length, now, target);
-      }
-      let mut last_tick = self.last_tick.lock().unwrap();
-      if Instant::now() >= target {
-        let tick = self
-            .ticker
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1);
+      {
+        let mut wakers = Vec::new();
         let mut sources = self.sources.lock().unwrap();
 
         // calculate demand from buffers & estimate usage
-        let mut demand = HashMap::new();
+        let mut demand_r = HashMap::new();
+        let mut demand_w = HashMap::new();
         for (key, source) in sources.iter_mut() {
           let rl = &mut *source.raw.lock().unwrap();
           if rl.inner.can_read() {
             rl.pre_read();
             usage_r.add_current_usage(rl.rbuf.reset_usage());
-            demand.insert((key, SourceDirection::Read), rl.rbuf.get_demand());
+            demand_r.insert(key, rl.rbuf.get_demand());
           }
           if rl.inner.can_write() {
             usage_w.add_current_usage(rl.wbuf.reset_usage());
-            demand.insert((key, SourceDirection::Write), rl.wbuf.get_demand());
+            demand_w.insert(key, rl.wbuf.get_demand());
           }
         }
         let total_r = usage_r.finalise_current_usage();
         let total_w = usage_w.finalise_current_usage();
         if total_r.1 > 0 || total_w.1 > 0 {
-          log::trace!("main_loop_async: tick {}: RX {:?}, TX {:?}", tick, total_r, total_w);
+          log::trace!("main_loop_async: tick {}: RX {:?}, TX {:?}", tick-1, total_r, total_w);
+        }
+        let td_r = demand_r.values().sum::<usize>();
+        let tn_r = demand_r.values().filter(|x| **x > 0).count();
+        let td_w = demand_w.values().sum::<usize>();
+        let tn_w = demand_w.values().filter(|x| **x > 0).count();
+        if td_r > 0 || td_w > 0 {
+          log::trace!("main_loop_async: tick {}: RD {} ({}), TD {} ({})", tick, td_r, tn_r, td_w, tn_w);
         }
 
         // calculate allowance & make it effective
-        let allowance = derive_allowance(demand);
+        let allowance_r = derive_allowance(demand_r);
+        let allowance_w = derive_allowance(demand_w);
         for (key, source) in sources.iter_mut() {
           let rl = &mut *source.raw.lock().unwrap();
           if rl.inner.can_read() {
-            rl.rbuf.add_allowance(*allowance.get(&(key, SourceDirection::Read)).unwrap());
+            rl.rbuf.add_allowance(*allowance_r.get(&key).unwrap());
             if rl.is_readable() {
               self.react_evt(&mut wakers, &**source, true, false, tick);
             }
           }
           if rl.inner.can_write() {
-            rl.wbuf.add_allowance(*allowance.get(&(key, SourceDirection::Write)).unwrap());
+            rl.wbuf.add_allowance(*allowance_w.get(&key).unwrap());
             rl.post_write();
             if rl.is_writable() {
               self.react_evt(&mut wakers, &**source, false, true, tick);
@@ -156,14 +163,19 @@ impl Reactor {
           }
         }
 
-        *last_tick = Instant::now();
+        // Wake up ready tasks.
+        for waker in wakers {
+            // Don't let a panicking waker blow everything up.
+            let _ = panic::catch_unwind(|| waker.wake());
+        }
       }
-      drop(last_tick);
 
-      // Wake up ready tasks.
-      for waker in wakers {
-          // Don't let a panicking waker blow everything up.
-          let _ = panic::catch_unwind(|| waker.wake());
+      let now = Instant::now();
+      if target > now {
+        Timer::after(target - now).await;
+        //log::trace!("main_loop_async: tick {}: running ok: {:?}-{:?}", tick, tick_length, (target - now));
+      } else {
+        log::warn!("main_loop_async: tick {}: running slow: {:?}+{:?}", tick, tick_length, (now - target));
       }
     }
   }

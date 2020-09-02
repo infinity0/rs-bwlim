@@ -39,15 +39,18 @@ async fn async_main() {
   // ^ can't use oneshot because we need to repeatedly await on the receive handle
   let server = Task::spawn(async move {
     let mut workers = Vec::new();
+    let mut idx = 0;
     loop {
       futures::select! {
         val = listener.accept().fuse() => {
           let (socket, _) = val.unwrap();
+          // FIXME: get idx from client
           let thread = if rate_limit {
-            Task::spawn(server_thread(RLAsync::new(RW(socket.into_inner().unwrap())).unwrap()))
+            Task::spawn(server_thread(idx, RLAsync::new(RW(socket.into_inner().unwrap())).unwrap()))
           } else {
-            Task::spawn(server_thread(socket))
+            Task::spawn(server_thread(idx, socket))
           };
+          idx += 1;
           workers.push(thread);
         },
         _ = is_shutdown.next() => {
@@ -65,15 +68,15 @@ async fn async_main() {
   thread::sleep(Duration::from_millis(1000)); // TODO: get rid of this
 
   // client threads
-  let clients = [0; 2].iter().map(|_| {
+  let clients = (0..2).map(|idx| {
     Task::spawn(async move {
       let mut stream = Async::<TcpStream>::connect(connect_addr).await.unwrap();
       if rate_limit {
         let mut stream = RLAsync::new(RW(stream.into_inner().unwrap())).unwrap();
-        client_thread(&mut stream, test_bytes).await;
+        client_thread(idx, &mut stream, test_bytes).await;
         stream.close().await.unwrap();
       } else {
-        client_thread(&mut stream, test_bytes).await;
+        client_thread(idx, &mut stream, test_bytes).await;
         stream.close().await.unwrap();
       }
     })

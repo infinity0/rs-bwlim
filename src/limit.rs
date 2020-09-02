@@ -1,11 +1,12 @@
 //! Data structures to help perform rate limiting.
 
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::result::Result;
+use std::collections::{HashMap, VecDeque};
 use std::cmp;
+use std::fmt::Debug;
 use std::io::{self, Read, Write, ErrorKind};
-use std::collections::VecDeque;
+use std::result::Result;
+
+use bytes::{BytesMut, Buf, BufMut};
 
 use crate::util::RorW;
 use self::Status::*;
@@ -14,7 +15,7 @@ use self::Status::*;
 #[derive(Debug)]
 pub struct RLBuf {
   /// Buffer to help determine demand, for rate-limiting.
-  buf: VecDeque<u8>,
+  buf: BytesMut,
   /// Index into `buf`, of the first data not allowed to be used. Everything
   /// before it will be used upon request.
   ///
@@ -31,7 +32,7 @@ impl RLBuf {
   */
   pub fn new_lb(init: usize) -> RLBuf {
     RLBuf {
-      buf: VecDeque::with_capacity(init),
+      buf: BytesMut::with_capacity(init),
       allowance: 0,
       last_used: 0,
     }
@@ -55,7 +56,7 @@ impl RLBuf {
   }
 
   pub fn get_demand_remaining(&self) -> usize {
-    self.get_demand_cap() - self.get_demand()
+    self.buf.capacity() - self.buf.len()
   }
 
   /** Add the allowance, which must not be greater than the demand.
@@ -88,9 +89,11 @@ impl RLBuf {
   }
 
   fn record_demand(&mut self, buf: &[u8]) {
-    for &i in buf {
-      self.buf.push_back(i);
-    }
+    self.buf.extend_from_slice(buf);
+  }
+
+  fn add_demand_cap(&mut self, more: usize) {
+    self.buf.reserve(more + self.get_demand_remaining());
   }
 
   fn take_allowance(&mut self, taken: usize) {
@@ -103,45 +106,25 @@ impl RLBuf {
 
   fn consume_read(&mut self, buf: &mut [u8]) -> usize {
     let to_drain = cmp::min(buf.len(), self.allowance);
-    let bb = self.buf.drain(..to_drain).collect::<Vec<_>>();
-    for (i, b) in bb.into_iter().enumerate() {
-      buf[i] = b;
-    }
+    self.buf.copy_to_slice(&mut buf[..to_drain]);
+    self.buf.reserve(to_drain);
     self.take_allowance(to_drain);
     to_drain
   }
 
-  fn consume_write<F, E>(&mut self, sz: usize, mut write: F) -> Result<usize, E>
+  fn consume_write<F, E>(&mut self, sz: usize, mut write: F) -> (usize, Option<E>)
   where F: FnMut (&[u8]) -> Result<usize, E> {
     let mut used = 0;
-    let mut res = Ok(());
-    let (a, b) = self.buf.as_slices();
-    let to_drain = cmp::min(a.len(), sz);
-    match write(&a[..to_drain]) {
-      Ok(n) => {
-        used += n;
-        if n == a.len() {
-          let to_drain = cmp::min(b.len(), sz - used);
-          match write(&b[..to_drain]) {
-            Ok(n) => {
-              used += n;
-            },
-            Err(e) => {
-              res = Err(e);
-            }
-          }
-        }
-      },
-      Err(e) => {
-        res = Err(e);
-      },
+    let mut err = None;
+    let to_drain = cmp::min(self.buf.len(), sz);
+    match write(&self.buf[..to_drain]) {
+      Ok(n) => used += n,
+      Err(e) => err = Some(e),
     }
-    self.buf.drain(..used);
+    self.buf.advance(used);
+    self.add_demand_cap(used);
     self.take_allowance(used);
-    match res {
-      Ok(()) => Ok(used),
-      Err(e) => Err(e),
-    }
+    (used, err)
   }
 }
 
@@ -202,15 +185,24 @@ impl<T> RateLimited<T> where T: RorW + ?Sized {
   pub fn pre_read(&mut self) {
     match self.rstatus {
       SOpen => {
-        // TODO: if allowance is 0, then automatically grow the buffer capacity
         let remain = self.rbuf.get_demand_remaining();
-        let mut buf = [0].repeat(remain); // TODO: optimise with uninit
+        if remain == 0 {
+          return;
+        }
+        // TODO: replace with https://github.com/rust-lang/rfcs/pull/2930
+        let mut buf: &mut [u8] = unsafe { std::mem::transmute(self.rbuf.buf.bytes_mut()) };
         match self.inner.read(&mut buf) { // TODO: assert non-blocking
           Ok(0) => {
             self.rstatus = SOk;
           },
           Ok(n) => {
-            self.rbuf.record_demand(&buf[..n]);
+            unsafe {
+              self.rbuf.buf.advance_mut(n);
+            }
+            if n >= remain {
+              // TODO: automatically grow the buffer capacity
+              log::debug!("rbuf pre_read filled buffer");
+            }
           },
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => (),
@@ -237,32 +229,33 @@ impl<T> RateLimited<T> where T: RorW + ?Sized {
 
   This is to be used by higher-level code, after it performs the rate-limiting.
   */
-  pub fn post_write(&mut self) -> bool {
-    match self.post_write_exact(self.wbuf.allowance) {
-      None => false,
-      Some(n) => n > 0,
-    }
+  pub fn post_write(&mut self) {
+    self.post_write_exact(self.wbuf.allowance);
   }
 
   pub fn is_writable(&self) -> bool {
-    self.wstatus == SOpen && self.wbuf.get_demand_remaining() > 0
+    self.wstatus != SOpen || self.wbuf.get_demand_remaining() > 0
   }
 
   // extra param is exposed for testing only
-  fn post_write_exact(&mut self, sz: usize) -> Option<usize> {
+  fn post_write_exact(&mut self, sz: usize) -> Option<io::Error> {
     match self.wbuf.get_demand() {
       0 => None,
       _ => match self.wbuf.allowance {
         0 => None,
         _ => {
           let w = &mut self.inner;
-          match self.wbuf.consume_write(sz, |b| w.write(b)) {
-            Ok(n) => Some(n),
-            Err(_) => {
-              self.wstatus = SErr;
-              None
+          let (_, err) = self.wbuf.consume_write(sz, |b| w.write(b));
+          if let Some(e) = err.as_ref() {
+            match e.kind() {
+              ErrorKind::WouldBlock => (),
+              ErrorKind::Interrupted => (),
+              _ => {
+                self.wstatus = SErr;
+              },
             }
           }
+          err
         }
       }
     }
@@ -289,7 +282,7 @@ impl<T> Write for RateLimited<T> where T: Write {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
     match self.wstatus {
       SOpen => {
-        // TODO: if allowance is 0, then automatically grow the buffer capacity
+        // TODO: figure out when it's appropriate to automatically grow the buffer capacity
         let remain = self.wbuf.get_demand_remaining();
         match remain {
           0 => Err(io::Error::new(ErrorKind::WouldBlock, "")),
@@ -311,8 +304,14 @@ impl<T> Write for RateLimited<T> where T: Write {
         // if there was an error, wbuf might not have been consumed, so output error even if wbuf is non-empty
         Err(unwrap_err_or(self.inner.write(&mut []), io::Error::new(ErrorKind::Other, "Ok after Err"))),
       _ => match self.wbuf.get_demand() {
-        0 => Ok(()),
-        _ => Err(io::Error::new(ErrorKind::WouldBlock, "")), // something else is responsible for calling post_write
+        0 => {
+          //println!("flush OK");
+          Ok(())
+        },
+        _ => {
+          //println!("flush waiting :( {} {}", self.wbuf.get_demand(), self.wbuf.allowance);
+          Err(io::Error::new(ErrorKind::WouldBlock, ""))
+        }, // something else is responsible for calling post_write
       }
     }
   }
@@ -329,7 +328,7 @@ impl UsageStats {
   pub fn new() -> UsageStats {
     UsageStats {
       samples: VecDeque::new(),
-      max_samples: 4096,
+      max_samples: 4096, // TODO: make configurable
       current_usage: (0, 0),
     }
   }
@@ -502,6 +501,7 @@ mod tests {
     let sy = 1024;
     let mut bf = RateLimited::new_lb(WO(file), sd);
     assert_eq!(sd, bf.wbuf.get_demand_cap());
+    assert_eq!(sd, bf.wbuf.get_demand_remaining());
     assert_eq!(0, bf.wbuf.get_demand());
     let buf = [0].repeat(sd + sx);
 
@@ -520,7 +520,7 @@ mod tests {
 
     assert_eq!(bf.wbuf.reset_usage(), (sy, sx + sy));
     // sy bytes of allowance were wasted
-    assert_eq!(bf.post_write_exact(0), None);
+    assert!(bf.post_write_exact(0).is_none());
 
     assert_eq!(bf.wbuf.reset_usage(), (0, 0));
     assert_eq!(sd - sx - sx, bf.wbuf.get_demand());

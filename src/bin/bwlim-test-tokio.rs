@@ -36,11 +36,15 @@ async fn main() {
   // ^ can't use oneshot because we need to repeatedly await on the receive handle
   let server = tokio::spawn(async move {
     let mut workers = Vec::new();
+    let mut idx = 0;
     loop {
       tokio::select! {
         val = listener.accept() => {
           let (socket, _) = val.unwrap();
-          workers.push(tokio::spawn(server_thread(Tokio02AsyncReadCompatExt::compat(socket))));
+          // FIXME: get idx from client
+          let thread = tokio::spawn(server_thread(idx, Tokio02AsyncReadCompatExt::compat(socket)));
+          idx += 1;
+          workers.push(thread);
         },
         _ = is_shutdown.recv() => {
           break;
@@ -55,10 +59,10 @@ async fn main() {
   });
 
   // client threads
-  let clients = [0; 2].iter().map(|_| {
+  let clients = (0..2).map(|idx| {
     tokio::spawn(async move {
       let mut stream = Tokio02AsyncWriteCompatExt::compat_write(TcpStream::connect(connect_addr).await.unwrap());
-      client_thread(&mut stream, test_bytes).await;
+      client_thread(idx, &mut stream, test_bytes).await;
       stream.into_inner().shutdown(Shutdown::Both).unwrap();
     })
   }).collect::<Vec<_>>();
